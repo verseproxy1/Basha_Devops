@@ -1,0 +1,73 @@
+# Reusable workflow: one-time RBAC setup for a service's container apps.
+# Grants each container app's managed identity AcrPull on the ACR and Key Vault
+# Secrets User on the Key Vault. It is called by a caller workflow that is itself
+# manual (workflow_dispatch), so the setup never runs as part of a normal deploy.
+#
+# Runs on the self-hosted runner and logs in with the runner VM's managed
+# identity. That identity has more rights than the deploy's OIDC login, which is
+# why this is separate and manual. Dry run is on by default.
+
+name: RBAC setup (shared)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev, qa or prod"
+        required: true
+        type: string
+      manifest_path:
+        description: "Path to the caller's env manifest, relative to the caller repo root"
+        required: true
+        type: string
+      dry_run:
+        description: "Report what would change without changing anything"
+        required: false
+        type: boolean
+        default: true
+      mgmt_identity_client_id:
+        description: "Client ID of the runner VM's managed identity, passed from the caller's variables"
+        required: true
+        type: string
+      shared_ref:
+        description: "mastec-ops branch, tag or commit holding the scripts"
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  rbac:
+    name: RBAC setup (${{ inputs.environment }})
+    runs-on: [self-hosted, linux, x64]
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check out caller repo
+        uses: actions/checkout@v4
+
+      - name: Check out shared scripts from mastec-ops
+        uses: actions/checkout@v4
+        with:
+          repository: Mastec-Quadgen-AzureApps/mastec-ops
+          ref: ${{ inputs.shared_ref }}
+          path: shared
+
+      # Log in as the runner VM's managed identity. This only works on the VM
+      # the identity is attached to.
+      - name: Log in as management VM identity
+        run: az login --identity --client-id "${{ inputs.mgmt_identity_client_id }}"
+
+      - name: Run setup-kv-rbac.sh
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+          ENV_NAME: ${{ inputs.environment }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "$DRY_RUN" == "true" ]]; then
+            bash shared/scripts/setup-kv-rbac.sh "$ENV_NAME" --dry-run
+          else
+            bash shared/scripts/setup-kv-rbac.sh "$ENV_NAME"
+          fi

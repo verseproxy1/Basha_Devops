@@ -1,0 +1,215 @@
+# Reusable workflow: deploy one service's Container Apps for one environment.
+# Called by a service repo's caller workflow, once per service, with `uses:`.
+#
+# A service can have several containers (web, worker, beat). The manifest lists
+# them in services.<service>.containerApps, and this workflow updates every one
+# of them, then waits until each is Running and Healthy.
+#
+# The scripts come from this repo (mastec-ops), so each caller repo does not
+# carry its own copy.
+
+name: Deploy container apps (shared)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev, qa or prod"
+        required: true
+        type: string
+      service:
+        description: "Service key in the manifest, e.g. qwest-requests"
+        required: true
+        type: string
+      image:
+        description: "Digest-pinned image reference for this service, from build-push-acr"
+        required: true
+        type: string
+      manifest_path:
+        description: "Path to the caller's env manifest, relative to the caller repo root"
+        required: true
+        type: string
+      shared_ref:
+        description: "mastec-ops branch, tag or commit holding the scripts. Use a commit SHA for prod."
+        required: false
+        type: string
+        default: main
+      skip_kv_check:
+        description: "Skip the advisory Key Vault secret check (only until the CI identity has Key Vault access)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }} (${{ inputs.environment }})
+    runs-on: [self-hosted, linux, x64]
+    environment: ${{ inputs.environment }}
+    steps:
+      # Step 1: the caller's code, which holds the manifest.
+      - name: Check out caller repo
+        uses: actions/checkout@v4
+
+      # Step 2: the shared scripts, checked out next to the caller's files.
+      - name: Check out shared scripts from mastec-ops
+        uses: actions/checkout@v4
+        with:
+          repository: Mastec-Quadgen-AzureApps/mastec-ops
+          ref: ${{ inputs.shared_ref }}
+          path: shared
+
+      # Step 3: fail early if the manifest is wrong. Beat must run as exactly one
+      # copy, so any service whose role is celery-beat must have maxReplicas 1.
+      - name: Validate manifest
+        env:
+          MANIFEST: ${{ inputs.manifest_path }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$(jq -r --arg s "$SERVICE" '.services[$s] // empty | type' "$MANIFEST")" != "object" ]]; then
+            echo "::error::Service $SERVICE is not in the manifest"
+            exit 1
+          fi
+
+          COUNT=$(jq -r --arg s "$SERVICE" '.services[$s].containerApps | length' "$MANIFEST")
+          if [[ "$COUNT" -lt 1 ]]; then
+            echo "::error::services.$SERVICE.containerApps is empty"
+            exit 1
+          fi
+
+          BAD=$(jq -r '.services | to_entries[]
+            | select(.value.role == "celery-beat")
+            | select((.value.scaling.maxReplicas // 0) != 1)
+            | .key' "$MANIFEST")
+          if [[ -n "$BAD" ]]; then
+            echo "::error::Beat services must have maxReplicas 1: $BAD"
+            exit 1
+          fi
+
+          echo "Manifest OK: $SERVICE has $COUNT container app(s)."
+
+      # Step 4: read the Azure login values for this environment.
+      - name: Read OIDC config from manifest
+        id: oidc
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          MANIFEST: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          echo "client_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].clientId' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+          echo "tenant_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].tenantId' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+          echo "subscription_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].subscription' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ steps.oidc.outputs.client_id }}
+          tenant-id: ${{ steps.oidc.outputs.tenant_id }}
+          subscription-id: ${{ steps.oidc.outputs.subscription_id }}
+
+      # Step 5: confirm the Container Apps and their identities exist before
+      # changing anything. This is the shared pre-deploy check.
+      - name: Pre-deploy checks
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          SKIP_KV: ${{ inputs.skip_kv_check }}
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP_KV" == "true" ]]; then
+            bash shared/scripts/pre-deploy-checks.sh "$ENV_NAME" "$SERVICE" --skip-kv-check
+          else
+            bash shared/scripts/pre-deploy-checks.sh "$ENV_NAME" "$SERVICE"
+          fi
+
+      # Step 6: for each container in the service's list, generate its config
+      # (secrets as Key Vault references, pinned image) and apply it.
+      # Containers are applied one after another; each runs with --no-wait and is
+      # checked in step 7.
+      - name: Apply container app config
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ inputs.image }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+
+          # The self-hosted runner keeps its workspace between runs, so clear the
+          # list of apps from any earlier run before adding this run's apps.
+          rm -f deployed-apps.txt
+
+          RG=$(jq -r --arg e "$ENV_NAME" '.environments[$e].resourceGroup' "$MANIFEST" | tr -d '\r')
+          if [[ -z "$RG" || "$RG" == "null" ]]; then
+            echo "::error::environments.$ENV_NAME.resourceGroup is missing in the manifest"
+            exit 1
+          fi
+
+          # {env} in a template is replaced with the environment name, e.g.
+          # qwest-requests-{env} becomes qwest-requests-dev.
+          while IFS= read -r TEMPLATE; do
+            [[ -z "$TEMPLATE" ]] && continue
+            APP="${TEMPLATE/\{env\}/$ENV_NAME}"
+            CONFIG="${APP}-config.yaml"
+
+            bash shared/scripts/generate-container-config.sh "$ENV_NAME" "$SERVICE" "$IMAGE" \
+              --app "$APP" --output "$CONFIG"
+
+            echo "Applying $CONFIG to $APP in $RG"
+            az containerapp update --name "$APP" --resource-group "$RG" --yaml "$CONFIG" --no-wait
+            echo "$APP" >> deployed-apps.txt
+          done < <(jq -r --arg s "$SERVICE" '.services[$s].containerApps[]' "$MANIFEST" | tr -d '\r')
+
+          echo "RG=$RG" >> "$GITHUB_ENV"
+
+      # Step 7: wait for every container to become Running and Healthy. The job
+      # fails and names the container that did not come up. The app is not
+      # rolled back automatically; use the rollback workflow for that.
+      - name: Wait until every container is healthy
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          TIMEOUT=600
+          FAILED=()
+
+          while IFS= read -r APP; do
+            echo "Checking $APP"
+            ELAPSED=0
+            OK=0
+            while (( ELAPSED < TIMEOUT )); do
+              STATE=$(az containerapp revision list --name "$APP" --resource-group "$RG" \
+                --query "[?properties.active].{run:properties.runningState,health:properties.healthState}" \
+                -o tsv 2>/dev/null | head -1 || true)
+              RUN=$(awk '{print $1}' <<< "$STATE")
+              HEALTH=$(awk '{print $2}' <<< "$STATE")
+              echo "  [${ELAPSED}s] running=${RUN:-none} health=${HEALTH:-none}"
+
+              if [[ ( "$RUN" == "Running" || "$RUN" == "RunningAtMaxScale" ) && "$HEALTH" == "Healthy" ]]; then
+                OK=1
+                break
+              fi
+              sleep 30
+              ELAPSED=$((ELAPSED + 30))
+            done
+
+            if [[ "$OK" -ne 1 ]]; then
+              FAILED+=("$APP")
+            fi
+          done < deployed-apps.txt
+
+          if (( ${#FAILED[@]} > 0 )); then
+            echo "::error::Not healthy after ${TIMEOUT}s: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "All containers of $SERVICE are healthy."

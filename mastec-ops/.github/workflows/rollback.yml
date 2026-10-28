@@ -1,0 +1,54 @@
+name: Rollback Container App
+
+# Manual trigger only: someone must click "Run workflow" and fill the form.
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Container App name (example: qwest-users-dev)"
+        required: true
+        type: string
+      resource_group:
+        description: "Resource group of the app (example: qwest-dev-rg)"
+        required: true
+        type: string
+      environment:
+        description: "Environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      image_ref:
+        description: "Known-good image with digest (registry/image@sha256:<64 hex chars>)"
+        required: true
+        type: string
+      smoke_test_url:
+        description: "HTTPS health-check URL of the app"
+        required: true
+        type: string
+
+# Needed so the called workflow can request an OIDC token for Azure login.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rollback:
+    # Calls the shared rollback workflow in the mastec-ops repo.
+    # Path = <org>/<repo>/<file path>@<ref>. Org/repo confirmed:
+    # Mastec-Quadgen-AzureApps/mastec-ops.
+    # @main is temporary for dev testing; pin to a full commit SHA for prod.
+    uses: Mastec-Quadgen-AzureApps/mastec-ops/.github/workflows/rollback-container-app.yaml@main
+    with:
+      app_name: ${{ inputs.app_name }}
+      resource_group: ${{ inputs.resource_group }}
+      environment: ${{ inputs.environment }}
+      image_ref: ${{ inputs.image_ref }}
+      smoke_test_url: ${{ inputs.smoke_test_url }}
+    # Passes the secrets of the repo running this caller (AZURE_CLIENT_ID,
+    # AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID) to the reusable workflow.
+    # Secrets are not stored in mastec-ops. Whether environment-level secrets
+    # also arrive is unverified; see APPROACH.md, open questions.
+    secrets: inherit

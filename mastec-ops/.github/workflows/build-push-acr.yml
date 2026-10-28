@@ -1,0 +1,124 @@
+# Reusable workflow: build every image a service needs and push it to the
+# environment's ACR. Called by a service repo's caller workflow with `uses:`.
+#
+# Inputs come from the caller. Everything service-specific (ACR name, Dockerfile,
+# ACR repository) is read from the caller's manifest, so this file never changes
+# per service.
+#
+# Output: `images`, a JSON object mapping each service key to its pushed image
+# reference, pinned by digest, e.g. {"qwest-requests":"qwestdevacr1.azurecr.io/qwest-requests@sha256:..."}.
+# The deploy step uses these digests, so the exact image that was built is deployed.
+
+name: Build and push images (shared)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev, qa or prod"
+        required: true
+        type: string
+      manifest_path:
+        description: "Path to the caller's env manifest, relative to the caller repo root"
+        required: true
+        type: string
+    outputs:
+      images:
+        description: "JSON map of service key to digest-pinned image reference"
+        value: ${{ jobs.build.outputs.images }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: Build ${{ inputs.environment }}
+    runs-on: [self-hosted, linux, x64]
+    environment: ${{ inputs.environment }}
+    outputs:
+      images: ${{ steps.build.outputs.images }}
+    steps:
+      # Step 1: get the caller's code (Dockerfiles and manifest).
+      - name: Check out caller repo
+        uses: actions/checkout@v4
+
+      # Step 2: read the Azure login values for this environment from the manifest.
+      # tr -d '\r' strips Windows line endings if the manifest was edited on Windows.
+      - name: Read OIDC config from manifest
+        id: oidc
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          MANIFEST: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          echo "client_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].clientId' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+          echo "tenant_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].tenantId' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+          echo "subscription_id=$(jq -r --arg e "$ENV_NAME" '.environments[$e].subscription' "$MANIFEST" | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      # Step 3: log in to Azure with OIDC. No client secret is used.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ steps.oidc.outputs.client_id }}
+          tenant-id: ${{ steps.oidc.outputs.tenant_id }}
+          subscription-id: ${{ steps.oidc.outputs.subscription_id }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 4: for every service in the manifest, build its image, push it with
+      # an immutable run-ID tag and `latest`, then record the digest.
+      - name: Build and push each service
+        id: build
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          MANIFEST: ${{ inputs.manifest_path }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          ACR=$(jq -r --arg e "$ENV_NAME" '.environments[$e].acr' "$MANIFEST" | tr -d '\r')
+          if [[ -z "$ACR" || "$ACR" == "null" ]]; then
+            echo "::error::environments.$ENV_NAME.acr is missing in the manifest"
+            exit 1
+          fi
+          LOGIN_SERVER="${ACR}.azurecr.io"
+
+          # Log Docker in to the registry using the Azure login from the previous step.
+          az acr login --name "$ACR"
+
+          IMAGES='{}'
+
+          # Each service key under "services" is one image. Dockerfile and ACR
+          # repository default to the common names if the manifest leaves them out.
+          for SERVICE in $(jq -r '.services | keys[]' "$MANIFEST"); do
+            DOCKERFILE=$(jq -r --arg s "$SERVICE" '.services[$s].dockerfile // "Dockerfile"' "$MANIFEST" | tr -d '\r')
+            REPO=$(jq -r --arg s "$SERVICE" '.services[$s].repository // $s' "$MANIFEST" | tr -d '\r')
+
+            echo "Building $SERVICE from $DOCKERFILE into $LOGIN_SERVER/$REPO"
+
+            # --push sends the image straight to ACR. --metadata-file writes the
+            # digest of the pushed image to a file we can read below.
+            docker buildx build \
+              --push \
+              --cache-from "type=registry,ref=${LOGIN_SERVER}/${REPO}:latest" \
+              --build-arg BUILDKIT_INLINE_CACHE=1 \
+              -t "${LOGIN_SERVER}/${REPO}:${RUN_ID}" \
+              -t "${LOGIN_SERVER}/${REPO}:latest" \
+              -f "$DOCKERFILE" \
+              --metadata-file "meta-${SERVICE}.json" \
+              .
+
+            DIGEST=$(jq -r '."containerimage.digest"' "meta-${SERVICE}.json")
+            if [[ -z "$DIGEST" || "$DIGEST" == "null" ]]; then
+              echo "::error::No digest returned for $SERVICE"
+              exit 1
+            fi
+
+            # Digest-pinned reference. Deploy and rollback use this form.
+            IMAGES=$(jq -c --arg s "$SERVICE" --arg i "${LOGIN_SERVER}/${REPO}@${DIGEST}" '. + {($s): $i}' <<< "$IMAGES")
+          done
+
+          echo "images=$IMAGES" >> "$GITHUB_OUTPUT"
+          echo "Built images: $IMAGES"

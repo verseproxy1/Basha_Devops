@@ -1,0 +1,38 @@
+# Central gitleaks config used by the shared secret-scan workflow.
+# Every service repo is scanned with this file. Add an allowlist entry here only
+# when a finding is a false positive that applies to every repo.
+
+[extend]
+useDefault = true
+
+# Catches sensitive environment-style assignments such as ERAN_PASSWORD or
+# EMAIL_API_KEY. The default rules miss names where the keyword is not a whole word.
+[[rules]]
+id = "repo-sensitive-env-assignment"
+description = "Detect sensitive environment-style assignments"
+regex = '''(?i)\b[A-Z0-9_]*(?:SECRET_KEY|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET|PRIVATE_KEY|AUTH_TOKEN|JWT_SECRET|ENCRYPTION_KEY|TOKEN|KEY)[A-Z0-9_]*\s*=\s*['"]([^'"]{8,})['"]'''
+secretGroup = 1
+keywords = [
+  "SECRET_KEY",
+  "SECRET",
+  "PASSWORD",
+  "PASSWD",
+  "API_KEY",
+  "ACCESS_TOKEN",
+  "REFRESH_TOKEN",
+  "CLIENT_SECRET",
+  "PRIVATE_KEY",
+  "AUTH_TOKEN",
+  "JWT_SECRET",
+  "ENCRYPTION_KEY",
+  "TOKEN",
+  "KEY",
+]
+
+# Test files and migrations hold dummy values, not real credentials.
+[[allowlists]]
+description = "Test files and migrations with dummy credentials"
+paths = [
+  '''(^|.*/)tests\.py$''',
+  '''(^|.*/)migrations/.*''',
+]
