@@ -64,12 +64,41 @@ jobs:
 
       # Step 3: fail early if the manifest is wrong. Beat must run as exactly one
       # copy, so any service whose role is celery-beat must have maxReplicas 1.
-      - name: Validate manifest
+      - name: Validate inputs and manifest
         env:
+          ENV_NAME: ${{ inputs.environment }}
           MANIFEST: ${{ inputs.manifest_path }}
           SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
+
+          case "$ENV_NAME" in
+            dev|qa|prod) ;;
+            *)
+              echo "::error::environment must be dev, qa or prod (got: '$ENV_NAME')"
+              exit 1
+              ;;
+          esac
+
+          if [[ ! -f "$MANIFEST" ]] || ! jq empty "$MANIFEST" >/dev/null 2>&1; then
+            echo "::error::manifest is missing or not valid JSON: $MANIFEST"
+            exit 1
+          fi
+
+          # The image must be pinned by digest, so the exact build is deployed.
+          if [[ ! "$IMAGE" =~ ^[^[:space:]]+@sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::image must be pinned by digest (registry/repo@sha256:<64 hex>), got: $IMAGE"
+            exit 1
+          fi
+
+          # The image must come from this service's own repository, so one
+          # service cannot be deployed with another service's image.
+          REPO=$(jq -r --arg s "$SERVICE" '.services[$s].repository // $s' "$MANIFEST" | tr -d '\r')
+          if [[ "$IMAGE" != */"$REPO"@sha256:* ]]; then
+            echo "::error::image does not belong to $SERVICE (expected repository '$REPO')"
+            exit 1
+          fi
 
           if [[ "$(jq -r --arg s "$SERVICE" '.services[$s] // empty | type' "$MANIFEST")" != "object" ]]; then
             echo "::error::Service $SERVICE is not in the manifest"
@@ -111,6 +140,41 @@ jobs:
           client-id: ${{ steps.oidc.outputs.client_id }}
           tenant-id: ${{ steps.oidc.outputs.tenant_id }}
           subscription-id: ${{ steps.oidc.outputs.subscription_id }}
+
+      # Step 4b: stop if any container app is in Multiple revision mode. In that
+      # mode the new revision gets no traffic until someone sets it, so the deploy
+      # would report success while users still get the old version.
+      - name: Check revision mode (must be Single)
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          MANIFEST: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+
+          RG=$(jq -r --arg e "$ENV_NAME" '.environments[$e].resourceGroup' "$MANIFEST" | tr -d '\r')
+          FAILED=0
+
+          while IFS= read -r TEMPLATE; do
+            [[ -z "$TEMPLATE" ]] && continue
+            APP="${TEMPLATE/\{env\}/$ENV_NAME}"
+
+            MODE="$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query 'properties.configuration.activeRevisionsMode' --output tsv)"
+            echo "$APP: revision mode $MODE"
+
+            if [[ "$MODE" != "Single" ]]; then
+              echo "::error::$APP is in '$MODE' revision mode. The deploy assumes Single mode, so traffic would not move to the new revision."
+              FAILED=1
+            fi
+          done < <(jq -r --arg s "$SERVICE" '.services[$s].containerApps[]' "$MANIFEST" | tr -d '\r')
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo "::error::Deploy stopped before any change. Switch the app to Single mode, or handle its traffic first."
+            exit 1
+          fi
+
+          echo "All container apps of $SERVICE are in Single revision mode."
 
       # Step 5: confirm the Container Apps and their identities exist before
       # changing anything. This is the shared pre-deploy check.
@@ -154,10 +218,23 @@ jobs:
 
           # {env} in a template is replaced with the environment name, e.g.
           # qwest-requests-{env} becomes qwest-requests-dev.
+          {
+            echo "## Deploy: $SERVICE ($ENV_NAME)"
+            echo ""
+            echo "| Container app | Previous image (rollback target) | New image |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           while IFS= read -r TEMPLATE; do
             [[ -z "$TEMPLATE" ]] && continue
             APP="${TEMPLATE/\{env\}/$ENV_NAME}"
             CONFIG="${APP}-config.yaml"
+
+            # Record the image that is running now, before the change. This is
+            # the digest a rollback would need, so it is written to the summary.
+            PREV_IMG="$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query 'properties.template.containers[0].image' --output tsv || true)"
+            echo "| \`$APP\` | \`${PREV_IMG:-unknown}\` | \`$IMAGE\` |" >> "$GITHUB_STEP_SUMMARY"
 
             bash shared/scripts/generate-container-config.sh "$ENV_NAME" "$SERVICE" "$IMAGE" \
               --app "$APP" --output "$CONFIG"

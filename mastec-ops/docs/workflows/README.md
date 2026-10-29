@@ -8,7 +8,7 @@ Reusable GitHub workflows and scripts used by the QWEST service repos. They live
 | [Deploy container apps](deploy-container-apps.md) | `deploy-container-apps.yml` | Updates a service's Container Apps and waits until healthy | Written, not run |
 | [Secret scan](secret-scan.md) | `secret-scan.yml` | Scans the repo for committed secrets with gitleaks | Written, not run |
 | [RBAC setup](rbac-setup.md) | `rbac-setup.yml` | One-time grant of registry and Key Vault access | Written, not run |
-| [Rollback](rollback-container-app.md) | `rollback-container-app.yaml` | Restores a known-good image by digest | Written, not run; one container per run |
+| [Rollback](rollback-container-app.md) | `rollback-container-app.yaml` | Restores a service's containers to known-good digests, together | Written, not run |
 
 ## How they fit together
 
@@ -36,3 +36,4 @@ manual, when needed
 - The `secrets: inherit` behaviour for environment-level secrets is untested.
 - The runner `nprd-git-runner-001` must have Docker. Not yet confirmed.
 - Sidecar services need one image per container. The deploy workflow currently sends one image to every container. See the deploy doc.
+- Rollback changes containers in order and does not revert automatically if a later step fails. See the rollback doc.

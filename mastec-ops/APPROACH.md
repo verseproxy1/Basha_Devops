@@ -134,7 +134,7 @@ summary on the run page
 
 Explanation: rollback is for recovery, not a step in every deploy. It restores all containers of the service together, so web and worker stay on matching versions. The single-revision check stops the job when Azure wouldn't move traffic to the restored revision. A revision is a saved snapshot of an app's full setup (image, environment variables, scaling).
 
-Status: the input checks, login, single-revision check, update, wait and summary are written. The loop over a service's containers is not written yet.
+Status: written, untested. It takes a `containers` list. Phase 1 checks every container and stops before any change. Phase 2 changes them in order. Phase 3 waits for each one. The caller and the rollback doc are updated to match.
 
 ## 7. Secret scan: secret-scan
 

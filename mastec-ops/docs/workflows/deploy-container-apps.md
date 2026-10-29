@@ -27,6 +27,8 @@ caller starts (environment, service, image)
      - every celery-beat service has maxReplicas 1
 4  read clientId, tenantId, subscription
 5  log in to Azure with OIDC
+5b check every container app is in Single revision mode
+     any app in Multiple mode → stop before any change
 6  pre-deploy checks (shared/scripts/pre-deploy-checks.sh)
      - each container app exists
      - each has a system-assigned identity

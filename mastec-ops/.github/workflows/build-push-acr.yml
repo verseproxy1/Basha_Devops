@@ -43,6 +43,58 @@ jobs:
       - name: Check out caller repo
         uses: actions/checkout@v4
 
+      # Step 1b: check every input and the manifest before anything is built.
+      # Fails early with a clear message, so no image is pushed from a bad setup.
+      - name: Validate inputs and manifest
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          MANIFEST: ${{ inputs.manifest_path }}
+        run: |
+          set -euo pipefail
+
+          case "$ENV_NAME" in
+            dev|qa|prod) ;;
+            *)
+              echo "::error::environment must be dev, qa or prod (got: '$ENV_NAME')"
+              exit 1
+              ;;
+          esac
+
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "::error::manifest not found: $MANIFEST"
+            exit 1
+          fi
+
+          if ! jq empty "$MANIFEST" >/dev/null 2>&1; then
+            echo "::error::manifest is not valid JSON: $MANIFEST"
+            exit 1
+          fi
+
+          # Each Azure value must be set for this environment and not left as a placeholder.
+          for KEY in acr clientId tenantId subscription resourceGroup; do
+            VALUE=$(jq -r --arg e "$ENV_NAME" --arg k "$KEY" '.environments[$e][$k] // empty' "$MANIFEST" | tr -d '\r')
+            if [[ -z "$VALUE" || "$VALUE" == REPLACE_* ]]; then
+              echo "::error::environments.$ENV_NAME.$KEY is missing or still a placeholder"
+              exit 1
+            fi
+          done
+
+          if [[ "$(jq -r '.services | length' "$MANIFEST")" -lt 1 ]]; then
+            echo "::error::the manifest has no services"
+            exit 1
+          fi
+
+          # Every service needs its Dockerfile in the caller repo.
+          while IFS= read -r SERVICE; do
+            DOCKERFILE=$(jq -r --arg s "$SERVICE" '.services[$s].dockerfile // "Dockerfile"' "$MANIFEST" | tr -d '\r')
+            if [[ ! -f "$DOCKERFILE" ]]; then
+              echo "::error::Dockerfile for $SERVICE not found: $DOCKERFILE"
+              exit 1
+            fi
+          done < <(jq -r '.services | keys[]' "$MANIFEST")
+
+          echo "Inputs and manifest OK for $ENV_NAME."
+
       # Step 2: read the Azure login values for this environment from the manifest.
       # tr -d '\r' strips Windows line endings if the manifest was edited on Windows.
       - name: Read OIDC config from manifest

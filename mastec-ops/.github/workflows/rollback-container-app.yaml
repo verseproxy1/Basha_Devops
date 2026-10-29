@@ -2,27 +2,34 @@ name: Reusable Azure Container App Rollback
 
 # Reusable workflow. It has no trigger of its own: a caller runs it with `uses:`
 # (see .github/workflows/rollback.yml). Inputs are passed in by the caller.
+#
+# Rolls back one or more Container Apps of the same service, together:
+#   Phase 1  check every container. Nothing is changed if any check fails.
+#   Phase 2  set each container to its known-good digest, in the order given.
+#   Phase 3  wait for each container's new revision, then check the health URL.
+#
+# One container (for example qwest_users) is a list with one entry.
+# Sidecars (for example qwest_requests) are a list with one entry per container.
+
 on:
   workflow_call:
     inputs:
-      app_name:
-        description: "Container App name (example: myapp-dev)"
-        required: true
-        type: string
-      resource_group:
-        description: "Resource group that contains the Container App"
-        required: true
-        type: string
       environment:
         description: "Deployment environment (dev, qa or prod)"
         required: true
         type: string
-      image_ref:
-        description: "Full known-good image reference, preferably pinned by digest"
+      resource_group:
+        description: "Resource group that contains the Container Apps"
+        required: true
+        type: string
+      containers:
+        description: >-
+          JSON array of {"app": "<container app name>", "digest": "<registry/repo@sha256:...>"}.
+          Order is the order of change. Put beat first, then worker, then web.
         required: true
         type: string
       smoke_test_url:
-        description: "Verified health-check URL reachable from the runner"
+        description: "HTTPS health-check URL of the service (its web app)"
         required: true
         type: string
     # Values are supplied by the caller through `secrets: inherit`. The names
@@ -40,72 +47,79 @@ permissions:
   contents: read
   id-token: write
 
-# One job, run in order from top to bottom. Any failing step stops the job.
 jobs:
   rollback:
-    name: Roll back ${{ inputs.app_name }} (${{ inputs.environment }})
-    # environment: attaches this job to the GitHub Environment of the same name,
-    # so that environment's secrets and approval rules apply to this run.
+    name: Roll back ${{ inputs.environment }}
     # nprd-git-runner-001 (org runner group az-self-hosted-runners) sits on the
     # Azure private network and already serves other repos.
     runs-on: [self-hosted, linux, x64]
+    # environment: attaches this job to the GitHub Environment of the same name,
+    # so that environment's secrets and approval rules apply to this run.
     environment: ${{ inputs.environment }}
 
     steps:
-      - name: Validate inputs and resolve target
-        id: target
+      # Step 1: check the inputs. Nothing in Azure is touched in this step.
+      # The validated list is written to a temp file for the later steps.
+      - name: Validate inputs
         shell: bash
         env:
-          APP_NAME: ${{ inputs.app_name }}
+          ENV_NAME: ${{ inputs.environment }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
-          TARGET_ENV: ${{ inputs.environment }}
-          IMAGE_REF: ${{ inputs.image_ref }}
+          CONTAINERS: ${{ inputs.containers }}
           SMOKE_TEST_URL: ${{ inputs.smoke_test_url }}
         run: |
           set -euo pipefail
 
-          # Environment must be one of the known values.
-          case "$TARGET_ENV" in
+          case "$ENV_NAME" in
             dev|qa|prod) ;;
             *)
-              echo "::error::environment must be dev, qa or prod (got: $TARGET_ENV)"
+              echo "::error::environment must be dev, qa or prod (got: '$ENV_NAME')"
               exit 1
               ;;
           esac
 
-          # Container App names: lowercase letters, digits, hyphens, max 32 chars.
-          if [[ ! "$APP_NAME" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
-            echo "::error::app_name is not a valid Container App name: $APP_NAME"
-            exit 1
-          fi
-
-          # Resource group names: letters, digits, . _ - ( ), max 90 chars.
           if [[ ! "$RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ ]]; then
             echo "::error::resource_group is not a valid resource group name: $RESOURCE_GROUP"
             exit 1
           fi
 
-          # Require a digest-pinned image reference.
-          if [[ ! "$IMAGE_REF" =~ ^[^[:space:]]+@sha256:[a-fA-F0-9]{64}$ ]]; then
-            echo "::error::image_ref must be a full image reference pinned to a SHA-256 digest."
-            exit 1
-          fi
-
-          # Prevent accidental use of a non-HTTPS health URL.
           if [[ ! "$SMOKE_TEST_URL" =~ ^https:// ]]; then
             echo "::error::smoke_test_url must use HTTPS."
             exit 1
           fi
 
-          {
-            echo "app_name=$APP_NAME"
-            echo "resource_group=$RESOURCE_GROUP"
-          } >> "$GITHUB_OUTPUT"
+          # The list must be a non-empty JSON array.
+          if ! jq -e 'type == "array" and length >= 1' <<< "$CONTAINERS" >/dev/null 2>&1; then
+            echo "::error::containers must be a non-empty JSON array of {app, digest}."
+            exit 1
+          fi
 
-          echo "Resolved target: $APP_NAME in $RESOURCE_GROUP"
+          # Write one line per container: app<TAB>digest.
+          IN="$RUNNER_TEMP/rollback-input.tsv"
+          jq -r '.[] | [.app, .digest] | @tsv' <<< "$CONTAINERS" | tr -d '\r' > "$IN"
+
+          while IFS=$'\t' read -r APP DIGEST; do
+            if [[ ! "$APP" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+              echo "::error::Not a valid Container App name: '$APP'"
+              exit 1
+            fi
+            if [[ ! "$DIGEST" =~ ^[^[:space:]]+@sha256:[a-fA-F0-9]{64}$ ]]; then
+              echo "::error::digest for $APP must be pinned by SHA-256 (registry/repo@sha256:<64 hex>)."
+              exit 1
+            fi
+          done < "$IN"
+
+          # The same app must not appear twice in one run.
+          if [[ -n "$(cut -f1 "$IN" | sort | uniq -d)" ]]; then
+            echo "::error::the same container app appears more than once in containers"
+            exit 1
+          fi
+
+          echo "Inputs OK. Containers to roll back, in order:"
+          cat "$IN"
 
       # Trades a short-lived GitHub OIDC token for an Azure token. No client
-      # secret is stored or used. Needs id-token: write (set above).
+      # secret is stored or used.
       - name: Azure login using OIDC
         uses: azure/login@v2
         with:
@@ -113,194 +127,186 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Read-only check: fails early if the app or resource group is wrong,
-      # before anything changes in Azure.
-      - name: Verify target exists
+      # Phase 1: check every container. Read-only. If any container fails a
+      # check, the job stops here and nothing has been changed.
+      # Action per container:
+      #   change  the container runs a different image, so it will be set
+      #   skip    the container already runs the requested image
+      - name: Phase 1 - check every container (nothing changes)
+        id: check
         shell: bash
         env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
         run: |
           set -euo pipefail
 
-          az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --output none
+          IN="$RUNNER_TEMP/rollback-input.tsv"
+          PLAN="$RUNNER_TEMP/rollback-plan.tsv"
+          : > "$PLAN"
+          FAILED=0
 
-      # Guard: the rollback waits for the newest revision to become live. In
-      # multiple-revision mode, Azure does not move traffic to it automatically,
-      # so the rollback could report success while users still hit the old
-      # revision. Stop here instead.
-      # Revision = a snapshot of the app's full setup (image, env vars, scale).
-      - name: Confirm single-revision mode
-        shell: bash
-        env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
-        run: |
-          set -euo pipefail
+          while IFS=$'\t' read -r APP DIGEST; do
+            echo "Checking $APP"
 
-          # Read the app's revision mode: "Single" or "Multiple".
-          MODE="$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query 'properties.configuration.activeRevisionsMode' \
-            --output tsv)"
-
-          echo "Revision mode: $MODE"
-
-          # Anything other than Single stops the job before any change is made.
-          if [[ "$MODE" != "Single" ]]; then
-            echo "::error::$APP_NAME is in '$MODE' revision mode. This rollback assumes Single mode."
-            exit 1
-          fi
-
-      - name: Record current image and revision
-        id: before
-        shell: bash
-        env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
-          IMAGE_REF: ${{ inputs.image_ref }}
-        run: |
-          set -euo pipefail
-
-          CURRENT_IMAGE="$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query 'properties.template.containers[0].image' \
-            --output tsv)"
-
-          CURRENT_REVISION="$(az containerapp show \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query 'properties.latestRevisionName' \
-            --output tsv)"
-
-          if [[ -z "$CURRENT_IMAGE" || "$CURRENT_IMAGE" == "None" ]]; then
-            echo "::error::Could not determine the current image."
-            exit 1
-          fi
-
-          if [[ -z "$CURRENT_REVISION" || "$CURRENT_REVISION" == "None" ]]; then
-            echo "::error::Could not determine the current revision."
-            exit 1
-          fi
-
-          echo "image=$CURRENT_IMAGE" >> "$GITHUB_OUTPUT"
-          echo "revision=$CURRENT_REVISION" >> "$GITHUB_OUTPUT"
-
-          echo "Current revision: $CURRENT_REVISION"
-          echo "Current image: $CURRENT_IMAGE"
-
-          # FIX 2: if the app already runs the requested image, Azure would not
-          # create a new revision. Stop now with a clear message instead of
-          # waiting for the timeout. Nothing has been changed at this point.
-          if [[ "$CURRENT_IMAGE" == "$IMAGE_REF" ]]; then
-            echo "::error::Already on this image: $APP_NAME is already running the requested image. No rollback performed. Check that the correct image_ref was supplied."
-            exit 1
-          fi
-
-      # The first step that changes Azure. It sets the app to the known-good
-      # image; Container Apps then creates a new revision.
-      - name: Deploy selected known-good image
-        shell: bash
-        env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
-          IMAGE_REF: ${{ inputs.image_ref }}
-        run: |
-          set -euo pipefail
-
-          az containerapp update \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$IMAGE_REF" \
-            --output none
-
-      # FIX 1: wait for a NEW revision (different from the one recorded before
-      # the update), then require that revision to run the requested image.
-      - name: Wait for new revision running the requested image
-        shell: bash
-        env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
-          IMAGE_REF: ${{ inputs.image_ref }}
-          PREVIOUS_REVISION: ${{ steps.before.outputs.revision }}
-        run: |
-          set -euo pipefail
-
-          TIMEOUT_SECONDS=300
-          INTERVAL_SECONDS=10
-          ELAPSED=0
-          REVISION=""
-          REV_IMAGE=""
-
-          while (( ELAPSED < TIMEOUT_SECONDS )); do
-            REVISION="$(az containerapp show \
-              --name "$APP_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --query 'properties.latestRevisionName' \
-              --output tsv)"
-
-            if [[ -z "$REVISION" || "$REVISION" == "None" || "$REVISION" == "$PREVIOUS_REVISION" ]]; then
-              echo "Waiting for a new revision (latest is still: ${REVISION:-none}, previous: $PREVIOUS_REVISION)"
-            else
-              REV_IMAGE="$(az containerapp revision show \
-                --name "$APP_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --revision "$REVISION" \
-                --query 'properties.template.containers[0].image' \
-                --output tsv 2>/dev/null || true)"
-
-              STATE="$(az containerapp revision show \
-                --name "$APP_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --revision "$REVISION" \
-                --query 'properties.provisioningState' \
-                --output tsv 2>/dev/null || true)"
-
-              RUNNING="$(az containerapp revision show \
-                --name "$APP_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --revision "$REVISION" \
-                --query 'properties.runningState' \
-                --output tsv 2>/dev/null || true)"
-
-              echo "New revision=$REVISION provisioning=$STATE running=$RUNNING"
-
-              if [[ "$STATE" == "Failed" ]]; then
-                echo "::error::New revision provisioning failed."
-                exit 1
-              fi
-
-              if [[ "$STATE" == "Provisioned" && "$RUNNING" == "Running" && "$REV_IMAGE" == "$IMAGE_REF" ]]; then
-                echo "New revision $REVISION is running the requested image."
-                exit 0
-              fi
+            if ! az containerapp show --name "$APP" --resource-group "$RESOURCE_GROUP" --output none; then
+              echo "::error::$APP not found in $RESOURCE_GROUP"
+              FAILED=1
+              continue
             fi
 
-            sleep "$INTERVAL_SECONDS"
-            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
-          done
+            # Single mode means Azure moves all traffic to the new revision.
+            # In Multiple mode the rollback could report success while users
+            # still reach the bad revision, so it stops here.
+            MODE="$(az containerapp show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+              --query 'properties.configuration.activeRevisionsMode' --output tsv)"
+            if [[ "$MODE" != "Single" ]]; then
+              echo "::error::$APP is in '$MODE' revision mode. This rollback assumes Single mode."
+              FAILED=1
+              continue
+            fi
 
-          echo "::error::Timed out waiting for a new revision running the requested image."
-          echo "::error::Last revision seen: ${REVISION:-none}"
-          echo "::error::Last revision image: ${REV_IMAGE:-unknown}"
-          echo "::error::Requested image: $IMAGE_REF"
-          exit 1
+            CUR_IMG="$(az containerapp show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+              --query 'properties.template.containers[0].image' --output tsv)"
+            CUR_REV="$(az containerapp show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+              --query 'properties.latestRevisionName' --output tsv)"
 
-      # Confirms the app answers after the rollback. If it fails, the app is NOT
-      # reverted automatically; the new revision stays live and needs a decision.
-      - name: Run application health check
+            if [[ -z "$CUR_IMG" || "$CUR_IMG" == "None" || -z "$CUR_REV" || "$CUR_REV" == "None" ]]; then
+              echo "::error::Could not read the current image or revision of $APP"
+              FAILED=1
+              continue
+            fi
+
+            if [[ "$CUR_IMG" == "$DIGEST" ]]; then
+              ACTION="skip"
+            else
+              ACTION="change"
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\n' "$APP" "$DIGEST" "$CUR_IMG" "$CUR_REV" "$ACTION" >> "$PLAN"
+            echo "  current: $CUR_IMG  ($CUR_REV)  action: $ACTION"
+          done < "$IN"
+
+          if [[ "$FAILED" -eq 1 ]]; then
+            echo "::error::Phase 1 failed. No container was changed."
+            exit 1
+          fi
+
+          # If every container already runs its requested image, there is nothing to roll back.
+          if ! grep -q $'\tchange$' "$PLAN"; then
+            echo "::error::Every container already runs the requested image. Nothing to roll back. Check the digests."
+            exit 1
+          fi
+
+          echo "Phase 1 passed."
+
+      # Phase 2: change each container, in the order given. A failure stops
+      # the job and names the containers that already changed.
+      - name: Phase 2 - set known-good images
+        shell: bash
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+        run: |
+          set -euo pipefail
+
+          PLAN="$RUNNER_TEMP/rollback-plan.tsv"
+          CHANGED=()
+
+          while IFS=$'\t' read -r APP DIGEST CUR_IMG CUR_REV ACTION; do
+            if [[ "$ACTION" != "change" ]]; then
+              echo "Skipping $APP (already on the requested image)"
+              continue
+            fi
+
+            echo "Setting $APP to $DIGEST"
+            if ! az containerapp update --name "$APP" --resource-group "$RESOURCE_GROUP" \
+                --image "$DIGEST" --output none; then
+              echo "::error::Failed to update $APP."
+              echo "::error::Already changed: ${CHANGED[*]:-none}. Not changed: the rest. Fix and run again, or roll back the changed ones."
+              exit 1
+            fi
+            CHANGED+=("$APP")
+          done < "$PLAN"
+
+          echo "Changed: ${CHANGED[*]:-none}"
+
+      # Phase 3: for each container, wait until it runs the requested image.
+      # A container that was changed needs a NEW revision. A skipped container
+      # only needs its latest revision to run the requested image.
+      - name: Phase 3 - wait for new revisions
+        shell: bash
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+        run: |
+          set -euo pipefail
+
+          PLAN="$RUNNER_TEMP/rollback-plan.tsv"
+          TIMEOUT=300
+          INTERVAL=10
+          FAILED=()
+
+          wait_for_container() {
+            local APP="$1" DIGEST="$2" PREV_REV="$3"
+            local ELAPSED=0 REV="" IMG="" STATE="" RUN=""
+
+            while (( ELAPSED < TIMEOUT )); do
+              REV="$(az containerapp show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+                --query 'properties.latestRevisionName' --output tsv)"
+
+              # For a changed container, the latest revision must be a new one.
+              if [[ -n "$REV" && "$REV" != "None" && ( -z "$PREV_REV" || "$REV" != "$PREV_REV" ) ]]; then
+                IMG="$(az containerapp revision show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+                  --revision "$REV" --query 'properties.template.containers[0].image' --output tsv 2>/dev/null || true)"
+                STATE="$(az containerapp revision show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+                  --revision "$REV" --query 'properties.provisioningState' --output tsv 2>/dev/null || true)"
+                RUN="$(az containerapp revision show --name "$APP" --resource-group "$RESOURCE_GROUP" \
+                  --revision "$REV" --query 'properties.runningState' --output tsv 2>/dev/null || true)"
+
+                echo "$APP: revision=$REV provisioning=$STATE running=$RUN"
+
+                if [[ "$STATE" == "Failed" ]]; then
+                  echo "::error::$APP: revision $REV failed to provision."
+                  return 1
+                fi
+                if [[ "$STATE" == "Provisioned" && "$RUN" == "Running" && "$IMG" == "$DIGEST" ]]; then
+                  echo "$APP is running the requested image."
+                  return 0
+                fi
+              fi
+
+              sleep "$INTERVAL"
+              ELAPSED=$((ELAPSED + INTERVAL))
+            done
+
+            echo "::error::$APP did not reach the requested image within ${TIMEOUT}s."
+            return 1
+          }
+
+          while IFS=$'\t' read -r APP DIGEST CUR_IMG CUR_REV ACTION; do
+            if [[ "$ACTION" == "change" ]]; then
+              PREV="$CUR_REV"
+            else
+              PREV=""
+            fi
+            if ! wait_for_container "$APP" "$DIGEST" "$PREV"; then
+              FAILED+=("$APP")
+            fi
+          done < "$PLAN"
+
+          if (( ${#FAILED[@]} > 0 )); then
+            echo "::error::Not running the requested image: ${FAILED[*]}"
+            exit 1
+          fi
+          echo "All containers are running the requested images."
+
+      # Confirms the service answers after the rollback. If it fails, nothing
+      # is reverted automatically; the restored revisions stay live.
+      - name: Health check
         shell: bash
         env:
           SMOKE_TEST_URL: ${{ inputs.smoke_test_url }}
         run: |
           set -euo pipefail
 
-          # Retries allow time for ingress and the application to become ready.
           for attempt in $(seq 1 12); do
             if curl --fail --silent --show-error \
               --connect-timeout 10 --max-time 20 \
@@ -308,33 +314,37 @@ jobs:
               echo "Health check passed."
               exit 0
             fi
-
             echo "Health check attempt $attempt failed."
             sleep 10
           done
 
-          echo "::error::Health check failed after retries."
+          echo "::error::Health check failed after retries. Restored revisions are still live; decide next steps."
           exit 1
 
-      # Writes a summary to the run's summary page. `if: always()` makes it run
-      # even when an earlier step failed, so the outcome is always recorded.
+      # Writes one line per container to the run summary. `if: always()` makes
+      # it run even when an earlier step failed, so the outcome is recorded.
       - name: Rollback summary
         if: always()
         shell: bash
         env:
-          APP_NAME: ${{ steps.target.outputs.app_name }}
-          RESOURCE_GROUP: ${{ steps.target.outputs.resource_group }}
-          PREVIOUS_IMAGE: ${{ steps.before.outputs.image }}
-          PREVIOUS_REVISION: ${{ steps.before.outputs.revision }}
-          TARGET_IMAGE: ${{ inputs.image_ref }}
+          ENV_NAME: ${{ inputs.environment }}
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
         run: |
+          PLAN="$RUNNER_TEMP/rollback-plan.tsv"
           {
-            echo "## Container App Rollback"
+            echo "## Container App rollback ($ENV_NAME)"
             echo ""
-            echo "- App: \`${APP_NAME:-unknown}\`"
-            echo "- Resource group: \`${RESOURCE_GROUP:-unknown}\`"
-            echo "- Previous image: \`${PREVIOUS_IMAGE:-unknown}\`"
-            echo "- Previous revision: \`${PREVIOUS_REVISION:-unknown}\`"
-            echo "- Requested image: \`${TARGET_IMAGE}\`"
-            echo "- Workflow result: **${{ job.status }}**"
+            echo "Resource group: \`$RESOURCE_GROUP\`"
+            echo ""
+            echo "| Container app | Previous image | Requested image | Action |"
+            echo "| --- | --- | --- | --- |"
+            if [[ -s "$PLAN" ]]; then
+              while IFS=$'\t' read -r APP DIGEST CUR_IMG CUR_REV ACTION; do
+                echo "| \`$APP\` | \`$CUR_IMG\` | \`$DIGEST\` | $ACTION |"
+              done < "$PLAN"
+            else
+              echo "| (none checked) | | | |"
+            fi
+            echo ""
+            echo "Workflow result: **${{ job.status }}**"
           } >> "$GITHUB_STEP_SUMMARY"

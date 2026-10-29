@@ -19,7 +19,9 @@ Last updated: 2026-10-28. Update this file when a task changes state. Claude Cod
 | 5 | Add single-revision check to rollback | Done | Basha | Not run yet |
 | 6 | Add explanatory comments to workflow files | Done | Basha | |
 | 7 | Write `APPROACH.md` and the online doc | Done | Basha | Online doc missing the review sections; re-sync if needed |
-| 8 | Update rollback for a list of containers per service | Not started | Basha | Rollback must restore a service as a set |
+| 8 | Update rollback for a list of containers per service | Done (untested) | Basha | Takes a `containers` list; Phase 1 checks all, Phase 2 changes in order, Phase 3 waits. Caller and doc updated |
+| 8a | Record previous digest in the deploy summary | Done (untested) | Basha | Deploy writes each app's previous image to the run summary |
+| 8b | Deploy stops for apps in Multiple revision mode | Done (untested) | Basha | Check runs before any change; deploy doc updated |
 | 9 | Write shared `build-push-acr` workflow | Done (untested) | Basha | Builds every service in the manifest, outputs digests |
 | 10 | Write shared `deploy-container-apps` workflow | Done (untested) | Basha | Loops over `containerApps`, checks beat replicas, polls health |
 | 10a | Write shared `secret-scan` workflow and central gitleaks config | Done (untested) | Basha | Pinned gitleaks v8.18.4; confirm version before use |
@@ -40,6 +42,9 @@ Last updated: 2026-10-28. Update this file when a task changes state. Claude Cod
 | 22 | Commit approved approach as HTML in the docs folder | Not started | Team | After the team agrees |
 | 23 | Write one doc per workflow (flow, inputs, testing, limits) in `docs/workflows/` | Done | Basha | Index in `docs/workflows/README.md` |
 | 24 | Push `mastec-ops` to GitHub on a branch | Blocked | Basha | Destination `verseproxy1/Basha_Devops` was blocked; confirm org repo or allow the push |
+| 25 | Add input and manifest validation to build and deploy | Done (untested) | Basha | Build: environment, manifest JSON, Azure values not placeholders, Dockerfiles exist. Deploy: environment, manifest, digest-pinned image from this service's repo |
+| 26 | Prod approval rules (GitHub Environments) | Not started | Basha | Set per service repo once code is ready; reviewer names needed |
+| 27 | Choose the first test repo and fill app name, environment and image | Not started | Team | Undecided; `qwest_users` suggested |
 
 ## Decisions made
 - Repo name: `mastec-ops`.
